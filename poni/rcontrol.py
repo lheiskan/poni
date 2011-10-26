@@ -63,7 +63,7 @@ class RemoteControl:
             return colors.Output(out_file, color="no").color
 
     def execute(self, command, verbose=False, color=None, output_lines=None,
-            output_file=None, quiet=False, **exec_options):
+        output_file=None, quiet=False, exec_options={}):
         if output_file is not None:
             stdout_file = output_file
             stderr_file = output_file
