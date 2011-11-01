@@ -14,9 +14,11 @@ import difflib
 from path import path
 import argh
 import argparse
+import hashlib
 from . import errors
 from . import util
 from . import colors
+import rcontrol
 
 import Cheetah.Template
 from Cheetah.Template import Template as CheetahTemplate
@@ -57,17 +59,9 @@ class Manager:
 
         for file_path in path(entry["source_path"]).files():
             dest_path = dest_dir / file_path.basename()
-            lstat = file_path.stat()
-            try:
-                rstat = remote.stat(dest_path)
-                # copy if mtime or size differs
-                # TODO: optional full contents comparison
-                copy = ((lstat.st_size != rstat.st_size)
-                        or (lstat.st_mtime != rstat.st_mtime))
-            except errors.RemoteError:
-                copy = True
-
-            if copy:
+    
+            uptodate, exists, statok, md5ok, lstat, rstat = self.compare(file_path, dest_path, remote)
+            if not uptodate:
                 self.log.info("copying: %s", dest_path)
                 remote.put_file(file_path, dest_path, callback=progress)
                 remote.utime(dest_path, (int(lstat.st_mtime),
@@ -75,6 +69,74 @@ class Manager:
                 sys.stderr.write("\n")
             elif verbose:
                 self.log.info("already copied: %s", dest_path)
+
+    # compare local and remote file
+    # remote exists, stat match, md5 match (if remote has md5sum command
+    # available')
+    def compare(self, file_path, dest_path, remote,
+            output=None):
+        md5ok = None
+
+        exists, statok, lstat, rstat = self.compare_stat(file_path, dest_path, remote)
+
+        if output:
+            md5ok = self.compare_md5(output, dest_path, remote)
+        return (statok or md5ok), exists, statok, md5ok, lstat, rstat
+
+    def compare_stat(self, file_path, dest_path, remote):
+        exists, statok, lstat, rstat = None, None, None, None
+        try:
+            lstat = file_path.stat()
+            rstat = remote.stat(dest_path)
+            statok = ((lstat.st_size == rstat.st_size) and (lstat.st_mtime == rstat.st_mtime))
+            exists = True
+        except errors.RemoteFileDoesNotExist, error:
+            self.log.debug("%s: %s: %s: %s", remote.node.name, dest_path,
+                           error.__class__.__name__, error)
+            exists=False
+        except errors.RemoteError, error:
+            self.log.error("%s: %s: %s: %s", remote.node.name, dest_path,
+                           error.__class__.__name__, error)
+        finally:
+            return (exists, statok, rstat, lstat)
+
+    # compare md5 of output against dest_path on the remote
+    def compare_md5(self, output, dest_path, remote):
+        md5ok = None
+        try:
+            output_md5=hashlib.md5()
+            output_md5.update(output)
+            for (status, result) in remote.execute_command("echo '%s  %s' |md5sum -c -" % (output_md5.hexdigest(), dest_path)):
+                if status==rcontrol.DONE:
+                    self.log.debug("DONE. remote md5 command result: %s" % (result)) 
+                    md5ok = (result == 0)
+                else:
+                    self.log.debug("%s" % (result))
+        except (errors.RemoteError), error:
+            self.log.debug('md5sum failed: %s' % repr(error))
+        finally:
+            return md5ok
+
+    # read existing file
+    def read_remote_file(self, dest_path, audit, deploy, remote):
+        failed, active_text=False, None
+        try:
+            active_text = remote.read_file(dest_path)
+        except errors.RemoteFileDoesNotExist, error:
+            active_text = None
+            if audit:
+                self.log.error("%s: %s: %s: %s", node_name, dest_path,
+                               error.__class__.__name__, error)
+                stats["error_count"] += 1
+        except errors.RemoteError, error:
+            failed = True
+            if audit or deploy:
+                self.log.error("%s: %s: %s: %s", node_name, dest_path,
+                               error.__class__.__name__, error)
+                stats["error_count"] += 1
+            active_text = None
+        finally:
+            return failed, active_text
 
     def verify(self, show=False, deploy=False, audit=False, show_diff=False,
                verbose=False, callback=None, path_prefix="", raw=False,
@@ -155,7 +217,7 @@ class Manager:
 
                 if (not audit and not deploy) and verbose:
                     # plain verify mode
-                    self.log.info("OK: %s: %s", node_name, dest_loc)
+                    self.log.info("OK: %s: %s", node_name, dest_path)
             except (IOError, errors.Error), error:
                 self.emit_error(entry["node"], source_path, error)
                 output = util.format_error(error)
@@ -207,41 +269,19 @@ class Manager:
                                                    color("---", "header")))
                 sys.stdout.flush()
 
-            remote = None
+            remote = entry["node"].get_remote(override=access_method)
+            uptodate, exists, statok, md5ok, lstat, rstat = self.compare(source_path, dest_path, remote, output=output)
 
-            if (audit or deploy) and dest_path and (not failed) and (not filtered_out):
-                # read existing file
-                try:
-                    remote = entry["node"].get_remote(override=access_method)
-                    active_text = remote.read_file(dest_path)
-                    stat = remote.stat(dest_path)
-                    if stat:
-                        active_time = datetime.datetime.fromtimestamp(
-                            stat.st_mtime)
-                    else:
-                        active_time = ""
-                except errors.RemoteFileDoesNotExist, error:
-                    active_text = None
-                    if audit:
-                        self.log.error("%s: %s: %s: %s", node_name, dest_path,
-                                       error.__class__.__name__, error)
-                        stats["error_count"] += 1
-                except errors.RemoteError, error:
-                    failed = True
-                    if audit or deploy:
-                        self.log.error("%s: %s: %s: %s", node_name, dest_path,
-                                       error.__class__.__name__, error)
-                        stats["error_count"] += 1
+            active_text, failed = None, False
+            if exists and not uptodate and (audit or deploy):
+                failed, active_text = self.read_remote_file(dest_path, audit, deploy, remote)
 
-                    active_text = None
-            else:
-                active_text = None
-
-            if active_text and audit:
+            if audit:
                 audit_error = self.audit_output(
-                    entry, dest_path, active_text, active_time, output,
+                    entry, dest_path, active_text, lstat, rstat, output,
                     show_diff=show_diff, color_mode=color_mode,
-                    verbose=verbose)
+                    verbose=verbose, exists=exists, uptodate=uptodate,
+                    statok=statok, md5ok=md5ok)
 
                 if audit_error:
                     stats["error_count"] += 1
@@ -253,7 +293,8 @@ class Manager:
                                      active_text, verbose=verbose,
                                      mode=entry.get("mode"),
                                      owner=entry.get("owner"),
-                                     group=entry.get("group"))
+                                     group=entry.get("group"),
+                                     uptodate=uptodate, statok=statok, md5ok=md5ok)
                 except errors.RemoteError, error:
                     stats["error_count"] += 1
                     self.log.error("%s: %s: %s", node_name, dest_path, error)
@@ -266,11 +307,25 @@ class Manager:
         return stats
 
     def deploy_file(self, remote, entry, dest_path, output, active_text,
-                    verbose=False, mode=None, owner=None, group=None):
-        if output == active_text:
-            # nothing to do
+                    verbose=False, mode=None, owner=None, group=None,
+                    uptodate=None, statok=None, md5ok=None):
+        if uptodate:
             if verbose:
-                self.log.info(self.audit_format, "OK",
+                info = []
+                if statok:
+                    info.append("stat")
+                if md5ok:
+                    info.append("md5")
+                if active_text and output == active_text:
+                   info.append("diff") 
+
+                self.log.info(self.audit_format, "OK (%s)" % (repr(info)),
+                      entry["node"].name, dest_path)
+
+        elif active_text and output == active_text:
+            # in case stat failed, and md5 was not available
+            if verbose:
+                self.log.info(self.audit_format, "OK (diff)",
                               entry["node"].name, dest_path)
         else:
             dest_dir = dest_path.dirname()
@@ -290,21 +345,55 @@ class Manager:
             # TODO: remote support
             post_process(dest_path)
 
-    def audit_output(self, entry, dest_path, active_text, active_time,
+    def audit_output(self, entry, dest_path, active_text, lstat, rstat,
                      output, show_diff=False, color_mode="auto",
-                     verbose=False):
+                     verbose=False, exists=True, uptodate=None, statok=None,
+                     md5ok=None):
+
         error = False
-        if (active_text is not None) and (active_text != output):
+
+        if exists is False:
             error = True
-            self.log.warning(self.audit_format, "DIFFERS",
+            self.log.warning(self.audit_format, "MISSING",
                              entry["node"].name, dest_path)
-            if show_diff:
+        elif uptodate:
+            if verbose:
+                info=[]
+                if md5ok:
+                    info.append('md5')
+                if statok:
+                    info.append('stat')
+                if active_text and active_text==output:
+                    info.append('diff')
+                self.log.info(self.audit_format, "OK (%s)" % repr(info), entry["node"].name,
+                              dest_path)
+        elif (active_text is not None) and (active_text == output):
+            # in case stat failed, and md5 was not available
+            self.log.info(self.audit_format, "OK (diff)", entry["node"].name,
+                          dest_path)
+        else:
+            error=True
+            info=[]
+            if md5ok==False:
+                info.append('md5')
+            if statok==False:
+                info.append('stat')
+            if active_text and (active_text != output):
+                info.append('diff')
+
+            self.log.warning(self.audit_format, "DIFFERS (%s)" % (repr(info)),
+                             entry["node"].name, dest_path)
+
+            if show_diff and active_text:
                 color = colors.Output(sys.stdout, color=color_mode).color
+                active_time = datetime.datetime.fromtimestamp(rstat.st_mtime)
+                config_time = datetime.datetime.fromtimestamp(lstat.st_mtime)
+
                 diff = difflib.unified_diff(
                     output.splitlines(True),
                     active_text.splitlines(True),
                     "config", "active",
-                    "", active_time, # TODO: mtime for config?
+                    config_time, active_time,
                     lineterm="\n")
 
                 diff_colors = {"+": "lgreen", "@": "white", "-": "lred"}
@@ -313,9 +402,6 @@ class Manager:
                         color(line, diff_colors.get(line[:1], "reset")))
 
                 sys.stdout.flush()
-        elif active_text and verbose:
-            self.log.info(self.audit_format, "OK", entry["node"].name,
-                          dest_path)
 
         return error
 
