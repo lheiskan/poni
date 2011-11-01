@@ -74,7 +74,6 @@ class Manager:
     # available')
     def compare(self, file_path, dest_path, remote,
             output=None):
-
         md5ok = None
         exists, statok, lstat, rstat = self.compare_stat(file_path, dest_path, remote)
 
