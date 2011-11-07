@@ -66,7 +66,6 @@ class Manager:
                 remote.put_file(file_path, dest_path, callback=progress)
                 remote.utime(dest_path, (int(lstat.st_mtime),
                                          int(lstat.st_mtime)))
-                sys.stderr.write("\n")
             elif verbose:
                 self.log.info("already copied: %s", dest_path)
 
@@ -75,8 +74,8 @@ class Manager:
     # available')
     def compare(self, file_path, dest_path, remote,
             output=None):
-        md5ok = None
 
+        md5ok = None
         exists, statok, lstat, rstat = self.compare_stat(file_path, dest_path, remote)
 
         if output:
@@ -88,7 +87,7 @@ class Manager:
         try:
             lstat = file_path.stat()
             rstat = remote.stat(dest_path)
-            statok = ((lstat.st_size == rstat.st_size) and (lstat.st_mtime == rstat.st_mtime))
+            statok = ((lstat.st_size == rstat.st_size) and (int(lstat.st_mtime) == int(rstat.st_mtime)))
             exists = True
         except errors.RemoteFileDoesNotExist, error:
             self.log.debug("%s: %s: %s: %s", remote.node.name, dest_path,
@@ -98,7 +97,7 @@ class Manager:
             self.log.error("%s: %s: %s: %s", remote.node.name, dest_path,
                            error.__class__.__name__, error)
         finally:
-            return (exists, statok, rstat, lstat)
+            return (exists, statok, lstat, rstat)
 
     # compare md5 of output against dest_path on the remote
     def compare_md5(self, output, dest_path, remote):
