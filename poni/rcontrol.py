@@ -169,7 +169,10 @@ def convert_local_errors(method):
                 raise errors.RemoteError("%s: %s" % (error.__class__.__name__,
                                                      error))
         except OSError, error:
-            raise errors.RemoteError("%s: %s" % (error.__class__.__name__,
+            if error.errno == errno.ENOENT:
+                raise errors.RemoteFileDoesNotExist(str(error))
+            else:
+                raise errors.RemoteError("%s: %s" % (error.__class__.__name__,
                                                  error))
 
     wrapper.__doc__ = method.__doc__
