@@ -152,6 +152,7 @@ class Manager:
                 self.log.debug("filtered: verify disabled: %r", entry)
                 continue
 
+
             filtered_out = False
             if callback and not callback(entry):
                 self.log.debug("filtered: callback: %r", entry)
@@ -166,6 +167,11 @@ class Manager:
             render = entry["render"]
             failed = False
             node_name = entry["node"].name
+
+            # binary file, omit from show
+            binary = False
+            if render and render.__name__=="render_text":
+                binary=True
 
             if entry["type"] == "dir":
                 if filtered_out:
@@ -226,77 +232,83 @@ class Manager:
                 # add the rendered output to the specified bucket
                 entry["config"].plugin.add_record(entry["dest_bucket"], text=output)
 
-            if show and not filtered_out:
-                if show_diff:
-                    diff = difflib.unified_diff(
-                        source_path.bytes().splitlines(True),
-                        output.splitlines(True),
-                        "template", "rendered",
-                        "", "",
-                        lineterm="\n")
+            if not filtered_out:
+                # handle show
+                if show:
+                    # for binary files, don't dump the contents onto the
+                    # terminal
+                    if binary:
+                        show_output="**** binary content ****"
+                    elif show_diff:
+                        diff = difflib.unified_diff(
+                            source_path.bytes().splitlines(True),
+                            output.splitlines(True),
+                            "template", "rendered",
+                            "", "",
+                            lineterm="\n")
+                        show_output = diff
+                    else:
+                        show_output = output
 
-                    show_output = diff
+                    if dest_path:
+                        dest_loc = dest_path
+                    elif entry.get("dest_bucket"):
+                        dest_loc = "bucket:%s" % entry["dest_bucket"]
+                    else:
+                        dest_loc = "(just rendered)"
 
-                else:
-                    show_output = output
-
-                if dest_path:
-                    dest_loc = dest_path
-                elif entry.get("dest_bucket"):
-                    dest_loc = "bucket:%s" % entry["dest_bucket"]
-                else:
-                    dest_loc = "(just rendered)"
-
-                identity = "%s%s%s" % (color(node_name, "node"),
-                                       color(": path=", "header"),
-                                       color(dest_loc, "path"))
-                sys.stdout.write("%s %s %s\n" % (color("--- BEGIN", "header"),
-                                               identity,
-                                               color("---", "header")))
-
-                if isinstance(show_output, (str, unicode)):
-                    print show_output
-                else:
-                    diff_colors = {"+": "lgreen", "@": "white", "-": "lred"}
-                    for line in show_output:
-                        sys.stdout.write(
-                            color(line, diff_colors.get(line[:1], "reset")))
-
-                sys.stdout.write("%s %s %s\n\n" % (color("--- END", "header"),
+                    identity = "%s%s%s" % (color(node_name, "node"),
+                                           color(": path=", "header"),
+                                           color(dest_loc, "path"))
+                    sys.stdout.write("%s %s %s\n" % (color("--- BEGIN", "header"),
                                                    identity,
                                                    color("---", "header")))
-                sys.stdout.flush()
 
-            remote = entry["node"].get_remote(override=access_method)
-            uptodate, exists, statok, md5ok, lstat, rstat = self.compare(source_path, dest_path, remote, output=output)
+                    if isinstance(show_output, (str, unicode)):
+                        print show_output
+                    else:
+                        diff_colors = {"+": "lgreen", "@": "white", "-": "lred"}
+                        for line in show_output:
+                            sys.stdout.write(
+                                color(line, diff_colors.get(line[:1], "reset")))
 
-            active_text, failed = None, False
-            if exists and not uptodate and (audit or deploy):
-                failed, active_text = self.read_remote_file(dest_path, audit, deploy, remote)
+                    sys.stdout.write("%s %s %s\n\n" % (color("--- END", "header"),
+                                                       identity,
+                                                       color("---", "header")))
+                    sys.stdout.flush()
 
-            if audit:
-                audit_error = self.audit_output(
-                    entry, dest_path, active_text, lstat, rstat, output,
-                    show_diff=show_diff, color_mode=color_mode,
-                    verbose=verbose, exists=exists, uptodate=uptodate,
-                    statok=statok, md5ok=md5ok)
+                # audit, deploy
+                else:
+                    remote = entry["node"].get_remote(override=access_method)
+                    uptodate, exists, statok, md5ok, lstat, rstat = self.compare(source_path, dest_path, remote, output=output)
 
-                if audit_error:
-                    stats["error_count"] += 1
+                    active_text, failed = None, False
+                    if exists and not uptodate and (audit or deploy):
+                        failed, active_text = self.read_remote_file(dest_path, audit, deploy, remote)
 
-            if deploy and dest_path and (not failed) and (not filtered_out):
-                remote = entry["node"].get_remote(override=access_method)
-                try:
-                    self.deploy_file(remote, entry, dest_path, output,
-                                     active_text, verbose=verbose,
-                                     mode=entry.get("mode"),
-                                     owner=entry.get("owner"),
-                                     group=entry.get("group"),
-                                     uptodate=uptodate, statok=statok, md5ok=md5ok)
-                except errors.RemoteError, error:
-                    stats["error_count"] += 1
-                    self.log.error("%s: %s: %s", node_name, dest_path, error)
-                    # NOTE: continuing
+                    if audit:
+                        audit_error = self.audit_output(
+                            entry, dest_path, active_text, lstat, rstat, output,
+                            show_diff=show_diff, color_mode=color_mode,
+                            verbose=verbose, exists=exists, uptodate=uptodate,
+                            statok=statok, md5ok=md5ok)
+
+                        if audit_error:
+                            stats["error_count"] += 1
+
+                    if deploy and dest_path and (not failed) and (not filtered_out):
+                        remote = entry["node"].get_remote(override=access_method)
+                        try:
+                            self.deploy_file(remote, entry, dest_path, output,
+                                             active_text, verbose=verbose,
+                                             mode=entry.get("mode"),
+                                             owner=entry.get("owner"),
+                                             group=entry.get("group"),
+                                             uptodate=uptodate, statok=statok, md5ok=md5ok)
+                        except errors.RemoteError, error:
+                            stats["error_count"] += 1
+                            self.log.error("%s: %s: %s", node_name, dest_path, error)
+                            # NOTE: continuing
 
         if stats["error_count"]:
             raise errors.VerifyError(
